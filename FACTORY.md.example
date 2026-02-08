@@ -1,0 +1,92 @@
+# FACTORY.md
+
+Configuration for [gh-dev-factory](https://clawhub.com/skills/gh-dev-factory).
+
+The factory reads this file at the start of every cycle.
+
+## Workflow
+
+- Branch naming: factory/<issue>-<slug>
+- Merge strategy: squash
+- Test command: npm test
+- Labels: planned (has implementation plan), blocked (skip during scan)
+
+## Boundaries
+
+Files and directories the factory must never modify:
+
+- .github/
+- LICENSE
+
+## Human Checkpoints
+
+- Factory may mark PRs ready for review: yes
+- Factory may auto-merge approved PRs: no
+- Factory may create labels if missing: yes
+
+## Budget
+
+- Billing: api
+- Max cycles per day: 10
+- Max open PRs: 2
+- Scan model: sonnet
+- Act model: opus
+
+<!--
+Billing options:
+
+api — pay-per-token. Factory tracks estimated cost per cycle.
+
+subscription — Claude Pro/Max via setup-token. Factory paces to avoid
+exhausting your 5-hour rolling window and weekly caps.
+
+Model routing:
+The scan model handles heartbeat/cron scans, label checks, and queue reads.
+The act model handles planning, implementation, code review, and PR work.
+Using Sonnet for scans costs ~60x less than Opus per run.
+On subscription billing, Sonnet scans barely dent your rate limit window.
+
+Subscription defaults (if billing: subscription):
+Interval extends to 4h. Scan + plan use Sonnet. Only implementation uses Opus.
+If rate-limited, factory backs off and doubles interval for the rest of the day.
+-->
+
+## Previews
+
+- Enabled: yes
+- Platform: vercel
+- Comment URL on PR: yes
+- Teardown on merge: automatic
+
+## Releases
+
+- Versioning: semver
+- Tag format: v{major}.{minor}.{patch}
+- Changelog source: merged PRs since last tag
+- Changelog categories:
+  - Features: enhancement label
+  - Fixes: bug label
+  - Breaking: breaking label or ! in PR title
+  - Docs: documentation label
+
+## Production
+
+- Deploy command: vercel --prod
+- Health check: https://myapp.com/api/health
+- Rollback: vercel rollback
+- Auto-deploy on release: no
+- Pre-flight:
+  - CI must be green on main
+  - No open issues labeled blocker
+
+## Rules
+
+<!--
+Add one line here whenever the factory gets something wrong.
+Each line prevents a future mistake. Examples:
+
+- Always run npm run lint before marking a PR ready
+- Never add dependencies without noting why in the PR description
+- Integration tests go in tests/integration/, unit tests in tests/unit/
+- Don't refactor unrelated code in the same PR
+-->
