@@ -30,9 +30,14 @@ def parse_json(raw: str) -> list:
 
 
 def get_repo() -> str:
+    # 1. Positional argument
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    # 2. Environment variable
     repo = os.environ.get("GH_REPO", "")
     if repo:
         return repo
+    # 3. Git remote
     try:
         url = subprocess.run(
             ["git", "remote", "get-url", "origin"],
@@ -43,7 +48,7 @@ def get_repo() -> str:
             return match.group(1)
     except Exception:
         pass
-    print("Cannot determine repo. Set GH_REPO or run from a checkout.", file=sys.stderr)
+    print("Cannot determine repo. Pass owner/repo as argument, set GH_REPO, or run from a checkout.", file=sys.stderr)
     sys.exit(1)
 
 
@@ -118,7 +123,7 @@ def scan_issues(repo: str, prs: list) -> list:
 
     for issue in issues:
         label_names = [l["name"] for l in issue.get("labels", [])]
-        if "blocked" in label_names:
+        if "blocked" in label_names or "epic" in label_names:
             continue
         if issue["number"] in linked_issues:
             continue
@@ -136,11 +141,128 @@ def scan_issues(repo: str, prs: list) -> list:
     return items
 
 
+def update_epic(repo: str):
+    """Find issues labeled 'epic' and sync their checklists with actual issue states."""
+    raw = gh([
+        "issue", "list", "--repo", repo, "--state", "open",
+        "--label", "epic",
+        "--json", "number,body",
+        "--limit", "10"
+    ])
+    epics = parse_json(raw)
+    if not epics:
+        return
+
+    # Get all issues (open + closed) referenced in epics
+    for epic in epics:
+        body = epic.get("body", "") or ""
+        if not body:
+            continue
+
+        # Find all issue refs like #11, #12 etc in checkbox lines
+        refs = set(int(m) for m in re.findall(r"- \[[ x]\] #(\d+)", body))
+        if not refs:
+            continue
+
+        # Check state of each referenced issue
+        closed_issues = set()
+        open_issues = set()
+        for num in refs:
+            try:
+                state_raw = gh([
+                    "issue", "view", str(num), "--repo", repo,
+                    "--json", "state", "--jq", ".state"
+                ])
+                if state_raw == "CLOSED":
+                    closed_issues.add(num)
+                else:
+                    open_issues.add(num)
+            except Exception:
+                pass
+
+        # Also find issues that reference this epic but aren't in the checklist yet
+        # Search for issues mentioning the epic number
+        search_raw = gh([
+            "issue", "list", "--repo", repo, "--state", "all",
+            "--json", "number,title,state,labels",
+            "--limit", "100"
+        ])
+        all_issues = parse_json(search_raw)
+
+        # Build map of existing issues for title lookup
+        issue_map = {i["number"]: i for i in all_issues}
+
+        # Find issues not in checklist (exclude the epic itself and other epics)
+        missing = []
+        for issue in all_issues:
+            num = issue["number"]
+            if num == epic["number"] or num in refs:
+                continue
+            labels = [l["name"] for l in issue.get("labels", [])]
+            if "epic" in labels:
+                continue
+            missing.append(issue)
+
+        # Update existing checkboxes
+        new_body = body
+        for num in refs:
+            if num in closed_issues:
+                new_body = re.sub(
+                    rf"- \[ \] #{num}\b",
+                    f"- [x] #{num}",
+                    new_body
+                )
+            elif num in open_issues:
+                new_body = re.sub(
+                    rf"- \[x\] #{num}\b",
+                    f"- [ ] #{num}",
+                    new_body
+                )
+
+        # Add missing issues to appropriate sections
+        if missing:
+            # Group by state
+            closed_missing = [i for i in missing if i["state"] == "CLOSED"]
+            open_missing = [i for i in missing if i["state"] != "CLOSED"]
+
+            # Build new lines
+            new_lines = []
+            for i in closed_missing:
+                new_lines.append(f"- [x] #{i['number']} — {i['title']}")
+            for i in open_missing:
+                new_lines.append(f"- [ ] #{i['number']} — {i['title']}")
+
+            if new_lines:
+                # Append to the end of the checklist section or before "Future Ideas"
+                addition = "\n" + "\n".join(new_lines)
+                # Try to insert before "Future Ideas" or similar section
+                future_match = re.search(r"\n(###?\s+🎯\s+Future)", new_body)
+                if future_match:
+                    new_body = new_body[:future_match.start()] + addition + new_body[future_match.start():]
+                else:
+                    new_body += addition
+
+        if new_body != body:
+            # Update the epic issue
+            try:
+                subprocess.run(
+                    ["gh", "issue", "edit", str(epic["number"]),
+                     "--repo", repo, "--body", new_body],
+                    capture_output=True, text=True
+                )
+                print(f"Updated epic #{epic['number']} checklist", file=sys.stderr)
+            except Exception as e:
+                print(f"Failed to update epic #{epic['number']}: {e}", file=sys.stderr)
+
+
 def main():
     repo = get_repo()
     pr_items, prs = scan_prs(repo)
     items = pr_items + scan_issues(repo, prs)
     items.sort(key=lambda x: (x["priority"], x.get("created", "")))
+
+    # Sync epic checklists
+    update_epic(repo)
 
     output = [
         {"type": i["type"], "number": i["number"], "title": i["title"],
