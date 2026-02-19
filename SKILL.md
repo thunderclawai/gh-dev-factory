@@ -1,6 +1,6 @@
 ---
 name: gh-dev-factory
-description: "Autonomous development factory using GitHub Issues/PRs as a work loop. Two cron jobs: factory-scan (orchestration, never codes) and factory-build (delegates to Claude Code, never codes directly). Also supports manual triggers. Requires gh CLI authenticated."
+description: "Autonomous development factory using GitHub Issues/PRs as a work loop. Single cron job scans for work, plans issues, delegates code to Claude Code, and auto-merges PRs. Requires gh CLI authenticated and Claude Code installed."
 license: MIT
 metadata:
   {"openclaw":{"emoji":"🏭","requires":{"bins":["gh","git","claude"]},"install":[{"id":"brew","kind":"brew","formula":"gh","bins":["gh"],"label":"Install GitHub CLI (brew)"}]}}
@@ -8,203 +8,232 @@ metadata:
 
 # gh-dev-factory
 
-Autonomous dev loop driven by two cron jobs with strict separation of concerns. One scans and orchestrates. The other builds by delegating to Claude Code. Neither ever writes code directly in its own session.
+Autonomous dev loop driven by a single cron job. Scans GitHub for work, plans issues, delegates implementation to Claude Code, and auto-merges PRs. GitHub is the source of truth — no state files needed.
 
-## Architecture: Two Jobs, Hard Boundary
+## How It Works
 
-The factory is split into two cron jobs because a single-job design fails: the orchestrator model (Sonnet) ignores delegation instructions and implements code changes directly using its own tools. The fix is architectural — make it physically impossible.
+One cron job runs every 30 minutes. Each cycle:
 
-### factory-scan (orchestrator)
+1. **Scan** — Run `scan.py` to rank open issues and PRs by priority
+2. **Cheap actions first** — Merge ready PRs, plan unplanned issues, add labels
+3. **One expensive action** — Delegate one implementation task to Claude Code via `run-claude.sh`
+4. **Auto-merge** — If Claude Code produces a passing PR, merge it in the same cycle
 
-**Runs every 20 minutes.** Scans GitHub for work, writes plans on issues, reviews PRs, merges approved PRs, manages labels and deploys. This job is the brain.
+The job never writes code directly. All implementation goes through `run-claude.sh` → Claude Code subprocess.
 
-**NEVER writes code. NEVER creates branches. NEVER opens PRs. NEVER runs Claude Code.** If scan finds work that requires implementation, it ensures the issue is labeled `planned` and stops. The build job picks it up next.
+## Architecture
 
-What scan DOES do:
-- Run `scan.py` to rank the work queue
-- Comment implementation plans on unplanned issues, add `planned` label
-- Review PRs for correctness (approve / request changes)
-- Merge approved PRs using configured strategy
-- Verify CI status, comment deploy URLs
-- Update `factory-state.md`
-- Respond `HEARTBEAT_OK` when idle or done
+### Single Job Design
 
-### factory-build (implementer)
+Earlier versions split scan and build into two jobs. In practice, a single combined job works better:
+- Plan + build + merge can happen in one 30-min cycle
+- No coordination overhead between jobs
+- Simpler to reason about and debug
+- GitHub is the only state — no factory-state.md files to manage
 
-**Runs every 20 minutes, offset by 10 minutes from scan.** Its ONLY job is to find the highest-priority item that needs code and delegate to Claude Code via `run-claude.sh`.
+### scan.py
 
-**NEVER writes code directly. NEVER uses Edit/Write tools on repo files.** It reads the scan output, picks one item, then runs `run-claude.sh` as a subprocess. Claude Code (the subprocess) does all implementation. The build job monitors exit status, pushes the branch, opens/updates the PR, and stops.
+`scripts/scan.py` scans a repo and outputs a ranked JSON queue:
 
-What build DOES do:
-- Run `scan.py` to find work needing implementation
-- For a `planned` issue: run `run-claude.sh <repo> <number> <branch> issue`
-- For a `draft` PR or `changes_requested` PR: run `run-claude.sh <repo> <number> <branch> pr-fix`
-- Push the branch, open or update the PR
-- Update `factory-state.md`
-- Respond `HEARTBEAT_OK` when idle or done
+```json
+[{"type": "issue", "number": 42, "title": "...", "state": "needs_plan", "priority": 1}]
+```
 
-### Why Two Jobs?
+Priority order: `changes_requested` > `approved` > `needs_review` > `draft` > `planned` > `needs_plan`
 
-| Concern | factory-scan | factory-build |
-|---------|-------------|---------------|
-| Model | sonnet (cheap) | sonnet (orchestrates Claude Code) |
-| Writes code? | NEVER | NEVER (delegates to Claude Code) |
-| Runs Claude Code? | NEVER | YES, via run-claude.sh |
-| Creates branches/PRs? | NO | YES (after Claude Code finishes) |
-| Reviews PRs? | YES | NO |
-| Merges PRs? | YES | NO |
-| Plans issues? | YES | NO |
+It also **auto-updates epic checklists** — any issue labeled `epic` gets its checkbox list synced with actual issue states (closed → checked, new issues → appended).
 
-## Cron Setup
+Issues labeled `blocked` or `epic` are skipped from the work queue.
+
+### run-claude.sh
+
+`scripts/run-claude.sh` delegates implementation to Claude Code:
 
 ```bash
-# SCAN: orchestration, planning, review, merge, deploy
-openclaw cron add \
-  --name "factory-scan" \
-  --every "20m" \
-  --tz "America/New_York" \
-  --session isolated \
-  --message "<see SCAN PROMPT below>" \
-  --model sonnet \
-  --announce
-
-# BUILD: delegates implementation to Claude Code subprocess
-openclaw cron add \
-  --name "factory-build" \
-  --every "20m" \
-  --offset "10m" \
-  --tz "America/New_York" \
-  --session isolated \
-  --message "<see BUILD PROMPT below>" \
-  --model sonnet \
-  --announce
+bash scripts/run-claude.sh <repo-dir> <number> <branch> <mode>
 ```
 
-## Manual Mode
+Modes:
+- `issue` — Implement a planned issue from scratch
+- `pr-fix` — Fix a failing PR or address review comments
 
-- `factory scan` — run scan only (read-only, reports queue)
-- `factory build` — run build only (picks one item, delegates to Claude Code)
-- `factory run` — run scan then build in sequence
-- `factory init` — interactive setup
-- `factory new owner/repo` — scaffold new repo
-- `factory release` — tag + changelog + GitHub Release
-- `factory deploy` — deploy to production
-- `factory status` — budget, queue, schedule report
+Claude Code reads the issue/PR, writes the code, and commits. The calling job handles branch push, PR creation, and merge.
 
-## Budget Awareness
+## Setup
 
-Every run burns tokens. FACTORY.md declares billing model and limits.
+### 1. Add FACTORY.md to your repo
 
-```
-## Budget
-- Billing: subscription  # or "api"
-- Max cycles per day: 10
-- Max open PRs: 2
-- Scan model: sonnet
-- Act model: sonnet  # Claude Code uses this for implementation
-```
-
-### State Persistence
+Create `FACTORY.md` in the repo root. This is the factory's configuration:
 
 ```markdown
-<!-- {workspace}/memory/factory-state.md -->
-# Factory State
-- **Date:** 2026-02-07
-- **Cycles today:** 3
-- **Last cycle:** 14:30 UTC — PR #42, pushed review fixes
-- **Open PRs:** 2
-- **Queue depth:** 5
+# FACTORY.md
+
+## Project
+- **Repo:** owner/repo
+- **Stack:** Your tech stack
+- **Description:** What this project does
+
+## Test & Lint
+- **Test command:** npm test (or python3 build.py, etc.)
+- **Lint command:** none
+
+## Merge Strategy
+- Squash merge
+- Delete branch after merge
+
+## Branch Naming
+- `factory/<issue-number>-<short-slug>`
+
+## Boundaries (do not touch)
+- `.github/`
+- `FACTORY.md`
+
+## Labels
+- `planned` — has implementation plan, ready to build
+- `blocked` — skip during factory scan
+- `epic` — tracking issue, skip
+
+## Human Checkpoints
+- Auto-merge when tests pass
+- No human review required
+
+## Budget
+- Max open PRs: 2
 ```
 
-On each run:
-1. Read factory-state.md
-2. If date changed, reset cycles to 0
-3. If cycles_today >= max, respond "budget exhausted" and stop (HEARTBEAT_OK)
-4. If open_prs >= max, only work on existing PRs
-5. Run one action, update state file
+### 2. Create the cron job
 
-## The Scan Cycle (factory-scan job)
+Single job that handles everything:
 
-Run `python3 {baseDir}/scripts/scan.py {repo}` to get the ranked queue.
+```bash
+openclaw cron add \
+  --name "factory-myproject" \
+  --cron "15,45 * * * *" \
+  --tz "Europe/Sofia" \
+  --session isolated \
+  --model sonnet \
+  --announce \
+  --message "<see CRON PROMPT below>"
+```
 
-If empty: respond `HEARTBEAT_OK`. Stop.
+### 3. Cron Prompt Template
 
-Otherwise, take the first item and do ONE of these (in priority order):
+```
+You are the factory for {owner}/{repo}. One scan per cycle, do everything you can.
 
-### PR — changes_requested
-Read review comments. DO NOT fix the code. That is the build job's responsibility. Stop. (Build job will pick this up.)
+## Step 1: Scan
+python3 {baseDir}/scripts/scan.py {owner}/{repo}
+gh pr list --repo {owner}/{repo} --state open --json number,isDraft | jq length
 
-### PR — approved
-Merge using configured strategy. Verify linked issue closed. Update state file. Stop.
+## Step 2: Do all cheap actions first
 
-### PR — needs_review
-Review for correctness, tests, rule adherence. Never approve a PR you authored. Request changes or approve. Stop.
+**Merge ready PRs (non-draft):**
+gh pr merge <number> --repo {owner}/{repo} --squash --delete-branch
 
-### PR — draft
-Check CI status. If CI is failing, stop — build job will fix it. If CI is green and all checklist items are checked, mark ready for review. Stop.
+**Do NOT merge draft PRs** — drafts mean incomplete work.
 
-### Issue — needs_plan
-Read the issue. Comment implementation plan: approach, files, test strategy. Add `planned` label. Stop.
+## Step 3: ONE expensive action (if any)
 
-### Issue — planned (no PR yet)
-Stop. This is the build job's responsibility.
+**Draft PR or changes_requested PR:**
+Delegate to Claude Code:
+bash {baseDir}/scripts/run-claude.sh {repoDir} <number> <branch> pr-fix
+Run with pty:true, background:true, timeout:900.
+Poll with process action:poll every 60 seconds. When done, read final logs.
 
-**Scan never creates branches, never writes code, never opens PRs.** If the highest-priority item needs implementation, scan skips it for the build job.
+**Issue — needs_plan:**
+Read the issue. Comment implementation plan. Add `planned` label.
+Then if open PRs < {maxOpenPRs}, immediately continue to build it.
 
-## The Build Cycle (factory-build job)
+**Issue — planned (no PR yet):**
+If open PRs >= {maxOpenPRs}, STOP.
+Delegate to Claude Code:
+bash {baseDir}/scripts/run-claude.sh {repoDir} <number> factory/<number>-<slug> issue
+Run with pty:true, background:true, timeout:900.
+Poll with process action:poll every 60 seconds. When done, read final logs.
 
-Run `python3 {baseDir}/scripts/scan.py {repo}` to get the ranked queue.
+## Step 4: After Claude Code finishes
+Check if PR was marked ready (non-draft). If so:
+gh pr merge <number> --repo {owner}/{repo} --squash --delete-branch
 
-If empty: respond `HEARTBEAT_OK`. Stop.
+## Step 5: Nothing to do?
+Respond HEARTBEAT_OK. Do NOT send any notifications.
 
-Otherwise, find the first item that needs implementation:
+## Hard rules
+- Do ALL cheap actions before expensive ones
+- ONE expensive action per cycle
+- NEVER write code directly. All implementation via run-claude.sh.
+- NEVER use Edit or Write tools on repo files.
+- Auto-merge ready PRs. No review step.
+- Max {maxOpenPRs} open PRs.
+- GitHub is source of truth.
+- Poll Claude Code every 60 seconds, not more frequent.
+- If Claude Code is already running (check process list), HEARTBEAT_OK.
+- Keep responses short.
+```
 
-### Issue — planned (no PR yet)
-If open_prs >= max_open_prs, skip. Otherwise:
-1. Determine branch name: `factory/{number}-{slug}`
-2. Run: `bash {baseDir}/scripts/run-claude.sh <repo-dir> <number> <branch> issue`
-3. If Claude Code exits 0: push branch, open draft PR with `Closes #{number}`
-4. Update state file. Stop.
+Replace:
+- `{owner}/{repo}` — GitHub repo (e.g. `thunderclawai/thunderclawai.github.io`)
+- `{baseDir}` — path to this skill (e.g. `~/.openclaw/workspace/skills/gh-dev-factory`)
+- `{repoDir}` — local checkout path (e.g. `~/.openclaw/workspace/my-repo`)
+- `{maxOpenPRs}` — from FACTORY.md budget (typically 2)
 
-### PR — draft (CI failing)
-1. Run: `bash {baseDir}/scripts/run-claude.sh <repo-dir> <number> <branch> pr-fix`
-2. If Claude Code exits 0: push the branch
-3. Update state file. Stop.
+## The Cycle In Detail
 
-### PR — changes_requested
-1. Run: `bash {baseDir}/scripts/run-claude.sh <repo-dir> <number> <branch> pr-fix`
-2. If Claude Code exits 0: push the branch
-3. Update state file. Stop.
+### Priority Order
 
-If no item needs implementation: respond `HEARTBEAT_OK`. Stop.
+Each cycle processes ONE expensive action. Cheap actions (merging ready PRs, adding labels) are batched first.
 
-**Build never reviews PRs, never merges, never plans issues, never writes code directly.** It ONLY delegates to Claude Code via run-claude.sh.
+1. **Merge ready PRs** — Non-draft PRs get squash-merged immediately
+2. **Plan unplanned issues** — Comment implementation plan, add `planned` label
+3. **Build planned issues** — Delegate to Claude Code, push PR
+4. **Fix failing PRs** — Delegate fixes to Claude Code
+
+### What Scan Does (cheap)
+- Rank the work queue
+- Auto-update epic checklists
+- Plan issues (comment + label)
+
+### What Build Does (expensive)
+- Delegate to Claude Code via `run-claude.sh`
+- Push branch, open/update PR
+- Merge if ready
 
 ## Rules
 
-- **One item per cycle.** Do not chain actions.
-- **Hard role separation.** Scan never codes. Build never reviews/merges/plans.
-- **Build never writes code directly.** All implementation goes through run-claude.sh → Claude Code subprocess.
-- **Never self-approve.** If you authored it, you cannot approve it.
-- **Small PRs.** If too large, break into sub-issues first.
+- **One expensive action per cycle.** Cheap actions can batch.
+- **Never write code directly.** All implementation via run-claude.sh → Claude Code.
 - **FACTORY.md is law.** Follow its rules, boundaries, and checkpoints.
-- **CLAUDE.md is context.** Follow its code style and conventions.
-- **Respect human checkpoints.** Never auto-merge if config says no.
-- **Releases are deliberate.** Never auto-tag or auto-release.
-- **Respect the budget.** Never exceed cycle limits. When exhausted, stop.
-- **Cheap when idle.** Minimal response when nothing to do.
-- **PR body is truth.** If a PR has unchecked items, the work is not done.
+- **GitHub is source of truth.** No state files. Check issue/PR state each cycle.
+- **Auto-merge when passing.** No human review unless FACTORY.md says otherwise.
+- **Small PRs.** If too large, break into sub-issues.
+- **Cheap when idle.** HEARTBEAT_OK when nothing to do.
+- **PR body is truth.** Unchecked items = work not done.
+- **Don't merge drafts.** Drafts mean Claude Code hasn't finished.
+
+## Manual Mode
+
+- `factory scan` — run scan only (reports queue)
+- `factory build` — run build only (picks one item, delegates)
+- `factory run` — scan then build in sequence
+- `factory status` — show queue depth, open PRs, recent activity
 
 ## Scan Output Format
 
-scan.py returns JSON sorted by priority:
-
 ```json
-[{"type": "issue|pr", "number": 42, "title": "...", "state": "...", "priority": 1}]
+[
+  {"type": "issue", "number": 42, "title": "Add dark mode", "state": "planned", "priority": 1},
+  {"type": "pr", "number": 43, "title": "feat: dark mode", "state": "needs_review", "priority": 2}
+]
 ```
 
-States: needs_plan, planned, draft, needs_review, changes_requested, approved.
+States: `needs_plan`, `planned`, `draft`, `needs_review`, `changes_requested`, `approved`
 
-Priority: changes_requested > approved > needs_review > draft > planned > needs_plan.
+## Epic Auto-Update
 
-Finish in-progress work before starting new work.
+`scan.py` automatically syncs epic checklists on every run:
+- Marks closed issues as `[x]`
+- Marks reopened issues as `[ ]`
+- Appends new issues not yet in the checklist
+- Only affects issues labeled `epic`
+
+No manual epic maintenance needed.
